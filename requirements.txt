@@ -1,0 +1,7 @@
+Django
+djangorestframework
+django-recurrence
+
+django-cors-headers
+pillow
+djangorestframework-simplejwt

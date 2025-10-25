@@ -1,0 +1,99 @@
+ {% extends "base.html" %}
+
+{% block content %}
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@event-calendar/build@3.10.0/event-calendar.min.css">
+<script src="https://cdn.jsdelivr.net/npm/@event-calendar/build@3.10.0/event-calendar.min.js"></script>
+
+    <div id="calendar"></div>
+
+ <div class="modal fade" id="eventModal" tabindex="-1" aria-labelledby="eventModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="eventModalLabel">Детали события</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p><strong>Название:</strong> <span id="modal-event-name"></span></p>
+                <p><strong>Дата:</strong> <span id="modal-event-date"></span></p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-success" id="modal-complete-btn">Выполнено</button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<script type="text/javascript">
+    document.addEventListener('DOMContentLoaded', function() {
+        let ec = new EventCalendar(document.getElementById('calendar'), {
+            eventSources: [{
+                url: "{% url 'events_json' %}",
+                method: "GET"
+            }],
+            lazyFetching: false,
+            view: 'dayGridMonth',
+            eventClick: function(info) {
+                showEventModal(info.event);
+            },
+            datesSet: function(info){
+                console.log(info);
+                fetch(`{% url 'обновить_инфу_бюджета' %}?start=${info.startStr}&end=${info.endStr}`, {
+                    method: "GET",
+                })
+                .then(response => response.json())
+                .then(data => {
+                    console.log(data);
+                    console.log("обновляем данные о бюджете");
+                })
+            }
+        });
+
+        function showEventModal(event) {
+            document.getElementById("modal-event-name").innerText = event.title;
+            document.getElementById("modal-event-date").innerText = new Date(event.start).toLocaleDateString();
+            document.getElementById("modal-complete-btn").dataset.eventId = event.id;
+            document.getElementById("modal-complete-btn").dataset.eventDate = event.start;  // Сохраняем дату
+
+            let modal = new bootstrap.Modal(document.getElementById("eventModal"));
+            modal.show();
+        }
+
+    document.getElementById("modal-complete-btn").addEventListener("click", function() {
+    let eventId = this.dataset.eventId;
+    let instanceDate = new Date(this.dataset.eventDate); // Преобразуем в объект Date
+    let formattedDate = instanceDate.getFullYear() + "-" +
+                        String(instanceDate.getMonth() + 1).padStart(2, '0') + "-" +
+                        String(instanceDate.getDate()).padStart(2, '0') + " " +
+                        String(instanceDate.getHours()).padStart(2, '0') + ":" +
+                        String(instanceDate.getMinutes()).padStart(2, '0') + ":" +
+                        String(instanceDate.getSeconds()).padStart(2, '0'); // ISO без таймзоны
+
+    fetch(`/mark_event_complete/${eventId}/`, {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": "{{ csrf_token }}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: `instance_datetime=${formattedDate}`
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.success) {
+            alert("Событие отмечено как выполненное!");
+            ec.refetchEvents();  // Обновляем календарь
+        }
+    })
+    .catch(error => console.error("Ошибка:", error));
+});
+
+    });
+</script>
+
+
+
+{% endblock %}
+
