@@ -12,6 +12,7 @@ class EventSerializer(serializers.ModelSerializer):
     class Meta:
         model = Event
         fields = '__all__'
+        read_only_fields = ('user',)
 
     def get_is_recurring(self, obj):
         return bool(obj.recurrence)
@@ -22,6 +23,15 @@ class EventInstanceSerializer(serializers.ModelSerializer):
         model = EventInstance
         fields = '__all__'
 
+
+    def validate_event(self, value):
+        """Гарантия, что выбирается только свой Event (удобно для DRF Browsable API)."""
+        request = self.context.get("request")
+        if request is None:
+            return value
+        if value.user != request.user:
+            raise serializers.ValidationError("Select your own event only.")
+        return value
 
 class SlotSerializer(serializers.ModelSerializer):
     class Meta:

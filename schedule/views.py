@@ -26,21 +26,52 @@ from .serializers import (
 )
 
 
-class EventViewSet(viewsets.ModelViewSet):
+class UserScopedQuerySetMixin:
+    user_lookup = "user"  # имя поля, по которому связана модель с пользователем
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return qs.filter(**{self.user_lookup: self.request.user})
+
+
+class EventViewSet(UserScopedQuerySetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = EventSerializer
 
-    def get_queryset(self):
-        return Event.objects.filter(user=self.request.user)
+    # ВАЖНО: нужен базовый queryset, чтобы super().get_queryset() в миксине не упал
+    queryset = Event.objects.all()
 
     def perform_create(self, serializer):
+        # user выставляем на сервере, а в сериализаторе делаем read_only=True
         serializer.save(user=self.request.user)
 
 
-class EventInstanceViewSet(viewsets.ModelViewSet):
+class EventInstanceViewSet(UserScopedQuerySetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
-    queryset = EventInstance.objects.all()
     serializer_class = EventInstanceSerializer
+
+    # Даем базовый queryset, чтобы super().get_queryset() не упал
+    queryset = EventInstance.objects.select_related("event").all()
+
+    # ⛳️ Переопределяем путь до владельца:
+    # EventInstance -> event -> user
+    user_lookup = "event__user"
+
+    def perform_create(self, serializer):
+        """Запрещаем создавать инстанс на событие, которое не принадлежит пользователю."""
+        event = serializer.validated_data.get("event")
+        if event.user != self.request.user:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You cannot use events that are not yours.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        """Тоже защищаем обновление от смены event на чужой."""
+        event = serializer.validated_data.get("event")
+        if event is not None and event.user != self.request.user:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You cannot assign someone else's event.")
+        serializer.save()
 
 
 # БЭК | views.py | EventExpandedListView — ЗАМЕНИТЬ КЛАСС ЦЕЛИКОМ
@@ -205,7 +236,6 @@ class EventExpandedListView(generics.ListAPIView):
         return Response(events_data)
 
 
-
 class DeleteEventOrOccurrenceView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -332,18 +362,6 @@ def get_recurrence_type(event) -> str:
     if event.recurrence:
         return 'rrule'
     return 'single'
-
-
-class EventViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
-    queryset = Event.objects.all()
-    serializer_class = EventSerializer
-
-
-class EventInstanceViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
-    queryset = EventInstance.objects.all()
-    serializer_class = EventInstanceSerializer
 
 
 class SlotViewSet(viewsets.ModelViewSet):
