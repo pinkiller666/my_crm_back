@@ -61,6 +61,8 @@ WEEK_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 
 
 class SchedulePatternForm(forms.ModelForm):
+    class Media:
+        js = ('admin/js/schedulepattern_toggle.js',)
     """
     Удобная форма:
     - В режиме ALTERNATING редактируем pattern_text (строка "2,2,2,1")

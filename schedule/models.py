@@ -445,6 +445,66 @@ class MonthSchedule(models.Model):
         uname = u() if callable(u) else getattr(self.user, 'username', str(self.user_id))
         return f"{uname} — {self.year}-{self.month:02d}: {self.pattern.name}"
 
+    @classmethod
+    def get_or_create_for_month(cls, user, year, month):
+        """
+        Возвращает (MonthSchedule, created)
+        - если на указанный месяц уже есть расписание → возвращает его;
+        - если нет → берёт самое свежее предыдущее;
+        - если вообще ничего нет → создаёт на основе шаблона 'Классика'.
+        """
+        # 1️⃣ Проверяем, есть ли уже расписание на этот месяц
+        schedule = cls.objects.filter(user=user, year=year, month=month).first()
+        if schedule:
+            return schedule, False
+
+        # 2️⃣ Если нет — ищем ближайшее прошлое
+        current_serial = year * 12 + month
+        prev_schedule = (
+            cls.objects.filter(user=user)
+            .annotate(serial=models.F("year") * 12 + models.F("month"))
+            .filter(serial__lt=current_serial)
+            .order_by("-year", "-month")
+            .first()
+        )
+        if prev_schedule:
+            return cls.objects.create(
+                user=user,
+                year=year,
+                month=month,
+                pattern=prev_schedule.pattern
+            ), True
+
+        # 3️⃣ Если нет вообще никаких расписаний — берём 'Классику'
+        from schedule.models import SchedulePattern
+        default_pattern = SchedulePattern.objects.filter(name__iexact="Классика").first()
+        if default_pattern is None:
+            # fallback на случай, если ready() не успел
+            from schedule.models import PatternMode
+            default_pattern = SchedulePattern.objects.create(
+                name="Классика",
+                mode=PatternMode.WEEKDAY,
+                days_off_at_start=0,
+                pattern_after_start=[],
+                weekday_map={
+                    "mon": "work",
+                    "tue": "work",
+                    "wed": "work",
+                    "thu": "work",
+                    "fri": "work",
+                    "sat": "off",
+                    "sun": "off",
+                },
+                description="Пятидневка: Пн–Пт рабочие, Сб–Вс выходные.",
+            )
+
+        return cls.objects.create(
+            user=user,
+            year=year,
+            month=month,
+            pattern=default_pattern
+        ), True
+
 
 class DayOverride(models.Model):
     month_schedule = models.ForeignKey(MonthSchedule, on_delete=models.CASCADE, related_name="overrides")

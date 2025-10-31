@@ -13,6 +13,9 @@ from rest_framework.views import APIView
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, generics, status
 from .models import CompletionStatus
+import calendar
+from datetime import date
+from django.contrib.auth import get_user_model
 
 from .utils.schedule_helper import generate_day_types, return_groups_by_pattern
 
@@ -125,7 +128,7 @@ class EventExpandedListView(generics.ListAPIView):
             Q(start_datetime__lte=end_dt) &
             (Q(end_datetime__gte=start_dt) | Q(end_datetime__isnull=True))
         )
-
+        events = events[:1000]
         for event in events:
             rtype = get_recurrence_type(event)
 
@@ -309,12 +312,13 @@ def schedule_preview(request):
     """
     Возвращает предварительный просмотр расписания за указанный год и месяц.
     В ответе:
-    - список дней с типами (work/off),
-    - pattern для фронта,
-    - группы (размеры логических блоков).
+      - список дней с типами (work/off/...),
+      - pattern для фронта,
+      - группы (длины недельных или рабочих блоков).
     """
     user_id = request.query_params.get('user')
 
+    # --- Проверка и парсинг параметров ---
     try:
         year = int(request.query_params.get('year'))
         month = int(request.query_params.get('month'))
@@ -325,31 +329,43 @@ def schedule_preview(request):
     if user_id is None:
         return Response({'error': 'Параметр user обязателен'}, status=400)
 
-    schedule = MonthSchedule.objects.filter(user=user_id, year=year, month=month).first()
+    # --- Получаем расписание ---
+    User = get_user_model()
+    user_obj = User.objects.get(pk=user_id)
 
-    if not schedule:
-        return Response({'error': 'Расписание не найдено'}, status=404)
+    schedule, created = MonthSchedule.get_or_create_for_month(user_obj, year, month)
 
-    schedule_data = SchedulePatternSerializer(schedule.pattern).data
+    pattern_data = SchedulePatternSerializer(schedule.pattern).data
 
-    result = generate_day_types(schedule)
+    # --- Генерация дней ---
+    start_date = date(year, month, 1)
+    _, days_in_month = calendar.monthrange(year, month)
+    try:
+        day_types = generate_day_types(schedule)
+    except ValueError as e:
+        return Response({'error': str(e)}, status=400)
 
-    days = [
-        {
+    days = []
+    for i, day_type in enumerate(day_types):
+        d = start_date + timedelta(days=i)
+        days.append({
             'date': d.isoformat(),
             'day': d.day,
-            'type': t,
-            'weekday': Weekday.get_day_by_number(d.isoweekday(), format_type='short_RU')
-        }
-        for d, t in result
-    ]
+            'weekday': Weekday.get_day_by_number(d.isoweekday(), format_type='short_RU'),
+            'type': day_type,
+        })
 
-    groups = return_groups_by_pattern(schedule)
+    # --- Группы ---
+    lengths, labels = return_groups_by_pattern(schedule)
+    groups = {'lengths': lengths, 'labels': labels}
 
+    # --- Финальный ответ ---
     return Response({
+        'year': year,
+        'month': month,
+        'pattern': pattern_data,
         'days': days,
-        'pattern': schedule_data,
-        'groups': groups
+        'groups': groups,
     }, status=200)
 
 
