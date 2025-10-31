@@ -361,12 +361,10 @@ def schedule_preview(request):
 
     # --- Финальный ответ ---
     return Response({
-        'year': year,
-        'month': month,
-        'pattern': pattern_data,
-        'days': days,
-        'groups': groups,
-    }, status=200)
+        "year": year,
+        "month": month,
+        "days": days_payload  # собран строго с ключами: date, weekday, day_type, is_today, group_id, overrides, notes
+    })
 
 
 def get_recurrence_type(event) -> str:
