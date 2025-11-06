@@ -334,8 +334,8 @@ def schedule_preview(request):
     user_obj = User.objects.get(pk=user_id)
 
     schedule, created = MonthSchedule.get_or_create_for_month(user_obj, year, month)
-
-    pattern_data = SchedulePatternSerializer(schedule.pattern).data
+    # 🛡️ на случай, если у MonthSchedule ещё не выбран pattern
+    pattern_data = SchedulePatternSerializer(schedule.pattern).data if schedule.pattern else None
 
     # --- Генерация дней ---
     start_date = date(year, month, 1)
@@ -349,10 +349,14 @@ def schedule_preview(request):
     for i, day_type in enumerate(day_types):
         d = start_date + timedelta(days=i)
         days.append({
-            'date': d.isoformat(),
-            'day': d.day,
-            'weekday': Weekday.get_day_by_number(d.isoweekday(), format_type='short_RU'),
-            'type': day_type,
+            "date": d.isoformat(),
+            "day": d.day,
+            "weekday": Weekday.get_day_by_number(d.isoweekday(), format_type="short_RU"),
+            "day_type": day_type,  # ✅ вместо 'type'
+            "is_today": d == date.today(),  # ✅ удобно для фронта
+            "group_id": None,  # ⚙️ можно будет позже заполнить, если используешь return_groups_by_pattern
+            "overrides": [],  # ⚙️ задел под будущие оверрайды
+            "notes": "",  # ⚙️ задел под будущие заметки
         })
 
     # --- Группы ---
@@ -363,7 +367,9 @@ def schedule_preview(request):
     return Response({
         "year": year,
         "month": month,
-        "days": days_payload  # собран строго с ключами: date, weekday, day_type, is_today, group_id, overrides, notes
+        "pattern": pattern_data,  # ← добавили
+        "groups": groups,  # ← добавили
+        "days": days  # ← было days_payload — исправили
     })
 
 
