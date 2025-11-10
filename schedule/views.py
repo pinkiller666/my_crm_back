@@ -1,35 +1,42 @@
+import logging
+import calendar
+from datetime import datetime, timedelta, date
+
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.timezone import make_aware, make_naive
+
+from rest_framework import generics, status, viewsets
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-
-from rest_framework.exceptions import ValidationError
-from datetime import datetime, timedelta
-from django.db.models import Q
+from rest_framework.views import APIView
 
 from common.choices import EventDateMode
-from .weekdays import Weekday
-from rest_framework.views import APIView
-from django.shortcuts import get_object_or_404
-from rest_framework import viewsets, generics, status
-from .models import CompletionStatus
-import calendar
-from datetime import date
-from django.contrib.auth import get_user_model
-
-from .utils.schedule_helper import generate_day_types, return_groups_by_pattern
-
 from .models import (
-    Event, EventInstance, Slot,
+    CompletionStatus, Event, EventInstance, Slot,
     SchedulePattern, MonthSchedule, DayOverride
 )
 from .serializers import (
     EventSerializer, EventInstanceSerializer, SlotSerializer,
     SchedulePatternSerializer, MonthScheduleSerializer, DayOverrideSerializer
 )
+from .utils.schedule_helper import generate_day_types, return_groups_by_pattern
+from .weekdays import Weekday
+
+from schedule.models import PatternMode
+from .utils.schedule_helper import group_days_by_cycles
+
+
+logger = logging.getLogger(__name__)
 
 
 class UserScopedQuerySetMixin:
+    """Фильтрует queryset по текущему пользователю через поле user_lookup."""
     user_lookup = "user"  # имя поля, по которому связана модель с пользователем
 
     def get_queryset(self):
@@ -40,9 +47,7 @@ class UserScopedQuerySetMixin:
 class EventViewSet(UserScopedQuerySetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = EventSerializer
-
-    # ВАЖНО: нужен базовый queryset, чтобы super().get_queryset() в миксине не упал
-    queryset = Event.objects.all()
+    queryset = Event.objects.all()  # базовый queryset для миксина
 
     def perform_create(self, serializer):
         # user выставляем на сервере, а в сериализаторе делаем read_only=True
@@ -52,32 +57,30 @@ class EventViewSet(UserScopedQuerySetMixin, viewsets.ModelViewSet):
 class EventInstanceViewSet(UserScopedQuerySetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = EventInstanceSerializer
-
-    # Даем базовый queryset, чтобы super().get_queryset() не упал
-    queryset = EventInstance.objects.select_related("event").all()
-
-    # ⛳️ Переопределяем путь до владельца:
-    # EventInstance -> event -> user
-    user_lookup = "event__user"
+    queryset = EventInstance.objects.select_related("parent_event").all()
+    # EventInstance -> parent_event -> user
+    user_lookup = "parent_event__user"
 
     def perform_create(self, serializer):
         """Запрещаем создавать инстанс на событие, которое не принадлежит пользователю."""
-        event = serializer.validated_data.get("event")
-        if event.user != self.request.user:
+        parent_event = serializer.validated_data.get("parent_event")
+        if parent_event.user != self.request.user:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You cannot use events that are not yours.")
         serializer.save()
 
     def perform_update(self, serializer):
-        """Тоже защищаем обновление от смены event на чужой."""
-        event = serializer.validated_data.get("event")
-        if event is not None and event.user != self.request.user:
+        """Тоже защищаем обновление от смены parent_event на чужой."""
+        parent_event = serializer.validated_data.get("parent_event")
+        if parent_event is not None and parent_event.user != self.request.user:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You cannot assign someone else's event.")
         serializer.save()
 
 
-# БЭК | views.py | EventExpandedListView — ЗАМЕНИТЬ КЛАСС ЦЕЛИКОМ
+# -----------------------------
+# Расширенная выдача вхождений
+# -----------------------------
 class EventExpandedListView(generics.ListAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = EventSerializer
@@ -97,26 +100,34 @@ class EventExpandedListView(generics.ListAPIView):
             raise ValidationError({"detail": "'year' and 'month' must be integers."})
 
         tz = timezone.get_current_timezone()
+        debug_mode = settings.DEBUG or (request.query_params.get('debug') == '1')
+        errors = []
+        debug_notes = []
 
-        # --- helpers (локально, чтобы не менять импорты модуля) ---
+        # --- helpers ---
         def _first_of_month(dt):
             if dt is None:
                 return None
-            # нормализуем к 1-му числу и 00:00, сохраняя tz
-            return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
+            # приводим к локальному tz и делаем ровно 00:00 первого числа
+            if dt.tzinfo is None:
+                aware = make_aware(dt, tz)
+            else:
+                aware = timezone.localtime(dt, tz)
+            aware = aware.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return aware
 
         def _add_months(dt, months):
-            # безопасно двигаемся на N месяцев вперёд; day=1 => всегда валидно
+            # dt — AWARE; крутим месяцы и сохраняем tz корректно
             y = dt.year + (dt.month - 1 + months) // 12
             m = (dt.month - 1 + months) % 12 + 1
-            return dt.replace(year=y, month=m, tzinfo=tz)
+            return dt.replace(year=y, month=m)
 
-        # --- границы выбранного месяца [start_dt, end_dt] ---
-        start_dt = datetime(year, month, 1, 0, 0, 0).replace(tzinfo=tz)
+        # --- границы выбранного месяца [start_dt, end_dt] (aware) ---
+        start_dt = make_aware(datetime(year, month, 1, 0, 0, 0), tz)
         if month == 12:
-            next_month = datetime(year + 1, 1, 1, 0, 0, 0).replace(tzinfo=tz)
+            next_month = make_aware(datetime(year + 1, 1, 1, 0, 0, 0), tz)
         else:
-            next_month = datetime(year, month + 1, 1, 0, 0, 0).replace(tzinfo=tz)
+            next_month = make_aware(datetime(year, month + 1, 1, 0, 0, 0), tz)
         end_dt = next_month - timedelta(seconds=1)
 
         events_data = []
@@ -127,116 +138,214 @@ class EventExpandedListView(generics.ListAPIView):
         ).filter(
             Q(start_datetime__lte=end_dt) &
             (Q(end_datetime__gte=start_dt) | Q(end_datetime__isnull=True))
-        )
-        events = events[:1000]
-        for event in events:
-            rtype = get_recurrence_type(event)
+        )[:1000]  # safety cap
 
-            # =========================
-            # A) MONTH-режим (NUMBER_OF_MONTH)
-            # =========================
-            if event.date_mode == EventDateMode.NUMBER_OF_MONTH:
-                # 1) одиночное "за месяц"
-                if not event.is_recurring_monthly:
-                    anchor = _first_of_month(event.start_datetime)
-                    if anchor and (start_dt <= anchor <= end_dt):
-                        occurrence_id = str(event.id)  # унификация: всегда строка
+        for event in events:
+            try:
+                rtype = get_recurrence_type(event)
+
+                # =========================
+                # A) MONTH-режим (NUMBER_OF_MONTH)
+                # =========================
+                if event.date_mode == EventDateMode.NUMBER_OF_MONTH:
+                    # 1) одиночное "за месяц"
+                    if not event.is_recurring_monthly:
+                        anchor = _first_of_month(event.start_datetime)
+                        if anchor and (start_dt <= anchor <= end_dt):
+                            occurrence_id = str(event.id)
+                            events_data.append({
+                                "id": occurrence_id,
+                                "occurrence_id": occurrence_id,
+                                "source_event_id": event.id,
+                                "instance_id": None,
+                                "datetime": anchor,
+                                "event": EventSerializer(
+                                    event, context={"request": request}
+                                ).data,
+                                "overlay": None,
+                                "is_recurring": False,
+                                "recurrence_type": "single",
+                            })
+                        continue  # MONTH-ветка обработана
+
+                    # 2) повторяемое "каждые N месяцев"
+                    interval = int(event.month_interval or 1)
+                    series_start = _first_of_month(event.start_datetime)
+                    series_end = _first_of_month(event.end_datetime)
+
+                    if not series_start or not series_end:
+                        # на валидатор надеемся, но защитимся от битых данных
+                        debug_notes.append({
+                            "event_id": event.id,
+                            "note": "monthly series skipped due to missing series_start/series_end"
+                        })
+                        continue
+
+                    current = series_start
+                    while current <= series_end:
+                        if start_dt <= current <= end_dt:
+                            instance = EventInstance.objects.filter(
+                                parent_event=event,
+                                instance_datetime=current
+                            ).first()
+                            unique_id = f"{event.id}_{int(current.timestamp())}"
+
+                            events_data.append({
+                                "id": unique_id,
+                                "occurrence_id": unique_id,
+                                "source_event_id": event.id,
+                                "instance_id": instance.id if instance else None,
+                                "datetime": current,
+                                "event": EventSerializer(
+                                    instance.parent_event if instance else event,
+                                    context={"request": request}
+                                ).data,
+                                "overlay": EventInstanceSerializer(
+                                    instance, context={"request": request}
+                                ).data if instance else None,
+                                "is_recurring": True,
+                                "recurrence_type": "monthly",
+                            })
+                        current = _add_months(current, interval)
+
+                    continue  # MONTH-ветка обработана
+
+                # =========================
+                # B) EXACT_DATE (без RRULE) => одиночное
+                # =========================
+                if rtype == 'single' and not event.recurrence:
+                    if start_dt <= event.start_datetime <= end_dt:
+                        occurrence_id = str(event.id)
                         events_data.append({
-                            # совместимость: старое поле "id" остаётся
                             "id": occurrence_id,
                             "occurrence_id": occurrence_id,
                             "source_event_id": event.id,
                             "instance_id": None,
-                            "datetime": anchor,
-                            "event": EventSerializer(event).data,
+                            "datetime": event.start_datetime,
+                            "event": EventSerializer(
+                                event, context={"request": request}
+                            ).data,
                             "overlay": None,
                             "is_recurring": False,
                             "recurrence_type": "single",
                         })
-                    continue  # MONTH-ветка обработана
-
-                # 2) повторяемое "каждые N месяцев"
-                interval = int(event.month_interval or 1)
-                series_start = _first_of_month(event.start_datetime)
-                series_end = _first_of_month(event.end_datetime)
-
-                if not series_start or not series_end:
-                    # на валидатор надеемся, но защитимся от битых данных
                     continue
 
-                current = series_start
-                while current <= series_end:
-                    if start_dt <= current <= end_dt:
+                # =========================
+                # C) EXACT_DATE + RRULE
+                # =========================
+                if event.recurrence:
+                    # django-recurrence обычно дружит с naive датами
+                    start_naive = make_naive(start_dt, tz)
+                    end_naive = make_naive(end_dt, tz)
+                    dtstart_naive = datetime(2010, 1, 1, 0, 0, 0)
+
+                    recurrences = event.recurrence.between(
+                        start_naive,
+                        end_naive,
+                        inc=True,
+                        dtstart=dtstart_naive
+                    )
+                    for recurrence in recurrences:
+                        # recurrence приходит naive — делаем его aware
+                        recurrence_aware = make_aware(recurrence, tz)
+
+                        unique_id = f"{event.id}_{int(recurrence_aware.timestamp())}"
                         instance = EventInstance.objects.filter(
                             parent_event=event,
-                            instance_datetime=current
+                            instance_datetime=recurrence_aware
                         ).first()
-                        unique_id = f"{event.id}_{int(current.timestamp())}"
 
                         events_data.append({
-                            "id": unique_id,  # совместимость
+                            "id": unique_id,
                             "occurrence_id": unique_id,
                             "source_event_id": event.id,
                             "instance_id": instance.id if instance else None,
-                            "datetime": current,
-                            "event": EventSerializer(instance.parent_event if instance else event).data,
-                            "overlay": EventInstanceSerializer(instance).data if instance else None,
+                            "datetime": recurrence_aware,
+                            "event": EventSerializer(
+                                instance.parent_event if instance else event,
+                                context={"request": request}
+                            ).data,
+                            "overlay": EventInstanceSerializer(
+                                instance, context={"request": request}
+                            ).data if instance else None,
                             "is_recurring": True,
-                            "recurrence_type": "monthly",
+                            "recurrence_type": "rrule",
                         })
-                    current = _add_months(current, interval)
 
-                continue  # MONTH-ветка обработана
-
-            # =========================
-            # B) EXACT_DATE (без RRULE) => одиночное
-            # =========================
-            if rtype == 'single' and not event.recurrence:
-                if start_dt <= event.start_datetime <= end_dt:
-                    occurrence_id = str(event.id)
-                    events_data.append({
-                        "id": occurrence_id,
-                        "occurrence_id": occurrence_id,
-                        "source_event_id": event.id,
-                        "instance_id": None,
-                        "datetime": event.start_datetime,
-                        "event": EventSerializer(event).data,
-                        "overlay": None,
-                        "is_recurring": False,
-                        "recurrence_type": "single",
-                    })
+            except Exception as e:
+                # Лог в консоль со стеком и контекстом
+                logger.exception(
+                    "all_events crash on event %s (user=%s, year=%s, month=%s)",
+                    getattr(event, "id", None), getattr(request.user, "id", None), year, month
+                )
+                # В ответ для дебага (если можно)
+                errors.append({
+                    "event_id": getattr(event, "id", None),
+                    "msg": str(e),
+                    "rtype": locals().get("rtype", None),
+                    "date_mode": getattr(event, "date_mode", None),
+                })
                 continue
 
-            # =========================
-            # C) EXACT_DATE + RRULE
-            # =========================
-            if event.recurrence:
-                recurrences = event.recurrence.between(
-                    start_dt,
-                    end_dt,
-                    inc=True,
-                    dtstart=datetime(2010, 1, 1, 0, 0).replace(tzinfo=tz)
-                )
-                for recurrence in recurrences:
-                    unique_id = f"{event.id}_{int(recurrence.timestamp())}"
-                    instance = EventInstance.objects.filter(
-                        parent_event=event,
-                        instance_datetime=recurrence
-                    ).first()
+        # Ответ
+        payload = events_data
+        if debug_mode:
+            payload = {
+                "events": events_data,
+                "errors": errors,
+                "meta": {
+                    "user_id": getattr(request.user, "id", None),
+                    "year": year,
+                    "month": month,
+                    "count_events": len(events_data),
+                    "count_errors": len(errors),
+                    "notes": debug_notes,
+                }
+            }
+        return Response(payload)
 
-                    events_data.append({
-                        "id": unique_id,  # совместимость
-                        "occurrence_id": unique_id,
-                        "source_event_id": event.id,
-                        "instance_id": instance.id if instance else None,
-                        "datetime": recurrence,
-                        "event": EventSerializer(instance.parent_event if instance else event).data,
-                        "overlay": EventInstanceSerializer(instance).data if instance else None,
-                        "is_recurring": True,
-                        "recurrence_type": "rrule",
-                    })
 
-        return Response(events_data)
+def group_days_by_iso_week(days):
+    """
+    Принимает days: List[dict] с ключом 'date' (YYYY-MM-DD) и возвращает List[List[dict]],
+    где каждая вложенная группа — это дни одной ISO-недели.
+    """
+    if not days:
+        return []
+
+    def _week_key(dstr: str):
+        # Безопасно парсим YYYY-MM-DD
+        dt = date.fromisoformat(dstr)
+        # ISO-неделя зависит от года/недели (на стыках года важна пара (year, week))
+        iso_year, iso_week, _ = dt.isocalendar()
+        return (iso_year, iso_week)
+
+    groups = []
+    current_group = []
+    current_key = None
+
+    for day in days:
+        d = day.get("date")
+        if not isinstance(d, str):
+            # пропустим странные элементы
+            continue
+
+        wk = _week_key(d)
+        if current_key is None:
+            current_key = wk
+            current_group = [day]
+        elif wk == current_key:
+            current_group.append(day)
+        else:
+            groups.append(current_group)
+            current_key = wk
+            current_group = [day]
+
+    if current_group:
+        groups.append(current_group)
+
+    return groups
 
 
 class DeleteEventOrOccurrenceView(APIView):
@@ -314,7 +423,6 @@ def schedule_preview(request):
     В ответе:
       - список дней с типами (work/off/...),
       - pattern для фронта,
-      - группы (длины недельных или рабочих блоков).
     """
     user_id = request.query_params.get('user')
 
@@ -345,32 +453,44 @@ def schedule_preview(request):
     except ValueError as e:
         return Response({'error': str(e)}, status=400)
 
+    # --- Генерация дней ---
     days = []
     for i, day_type in enumerate(day_types):
         d = start_date + timedelta(days=i)
         days.append({
-            "date": d.isoformat(),
+            "date": d.isoformat(),  # 'YYYY-MM-DD'
             "day": d.day,
             "weekday": Weekday.get_day_by_number(d.isoweekday(), format_type="short_RU"),
-            "day_type": day_type,  # ✅ вместо 'type'
-            "is_today": d == date.today(),  # ✅ удобно для фронта
-            "group_id": None,  # ⚙️ можно будет позже заполнить, если используешь return_groups_by_pattern
-            "overrides": [],  # ⚙️ задел под будущие оверрайды
-            "notes": "",  # ⚙️ задел под будущие заметки
+            "day_type": day_type,
+            "is_today": d == date.today(),
+            "group_id": None,
+            "overrides": [],
+            "notes": "",
         })
 
-    # --- Группы ---
-    lengths, labels = return_groups_by_pattern(schedule)
-    groups = {'lengths': lengths, 'labels': labels}
+    # ✅ Нормализуем ключи под фронт: day_type -> type
+    normalized_days = []
+    for item in days:
+        new_item = dict(item)
+        new_item["type"] = new_item.pop("day_type")
+        normalized_days.append(new_item)
+    days = normalized_days
 
-    # --- Финальный ответ ---
-    return Response({
+    # --- Группы по ISO-неделям из уже нормализованных days
+    if schedule.pattern and schedule.pattern.mode == PatternMode.WEEKDAY:
+        groups = group_days_by_iso_week(days)  # недельная нарезка (пн–вс)
+    else:
+        groups = group_days_by_cycles(days, schedule.pattern)
+
+    payload = {
         "year": year,
         "month": month,
-        "pattern": pattern_data,  # ← добавили
-        "groups": groups,  # ← добавили
-        "days": days  # ← было days_payload — исправили
-    })
+        "pattern": pattern_data,
+        "grouping_mode": "week" if schedule.pattern and schedule.pattern.mode == PatternMode.WEEKDAY else "type_runs",
+        "groups": groups,
+        "days": days,
+    }
+    return Response(payload)
 
 
 def get_recurrence_type(event) -> str:

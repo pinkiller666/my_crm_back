@@ -190,3 +190,71 @@ def return_groups_by_pattern(schedule_or_date, days_in_month: int = None, patter
         if days_in_month is None or pattern is None:
             raise ValueError("Необходимо указать days_in_month и pattern при прямом вызове.")
     return _return_groups_core(start_date, days_in_month, pattern)
+
+
+def group_days_by_type_runs(days):
+    """
+    Принимает days (список объектов дня с ключом 'type').
+    Возвращает список групп, где каждая группа — непрерывный пробег одинакового type.
+    Формат групп такой же, как у group_days_by_iso_week: список списков days.
+    """
+    groups = []
+    if not days:
+        return groups
+
+    current_type = days[0]["type"]
+    bucket = []
+
+    for item in days:
+        if item["type"] == current_type:
+            bucket.append(item)
+        else:
+            groups.append(bucket)
+            bucket = [item]
+            current_type = item["type"]
+
+    if bucket:
+        groups.append(bucket)
+
+    return groups
+
+# BACK — schedule/utils/schedule_helper.py
+
+def group_days_by_cycles(days, pattern=None):
+    """
+    Разбивает список days (элементы с ключом 'type') на группы:
+      • первую — стартовые выходные (days_off_at_start),
+      • следующие — по длине одного цикла (сумма pattern_after_start),
+      • последняя — хвост, если месяц обрывается в середине цикла.
+
+    Если pattern пуст или список pattern_after_start не задан —
+    возвращает всё одной группой.
+    """
+    if not days:
+        return []
+
+    if not pattern:
+        return [days]
+
+    pattern_list = list(getattr(pattern, "pattern_after_start", []) or [])
+    if not pattern_list:
+        return [days]
+
+    begin_off = int(getattr(pattern, "days_off_at_start", 0) or 0)
+    cycle_len = sum(int(x) for x in pattern_list)
+
+    groups = []
+    idx = 0
+
+    # 1️⃣ стартовые off (если есть)
+    if begin_off > 0:
+        groups.append(days[idx: idx + begin_off])
+        idx += begin_off
+
+    # 2️⃣ циклы по cycle_len (хвост попадёт последней неполной группой)
+    while idx < len(days):
+        next_idx = min(idx + cycle_len, len(days))
+        groups.append(days[idx: next_idx])
+        idx = next_idx
+
+    return groups
