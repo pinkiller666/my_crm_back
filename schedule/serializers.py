@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 from accounting.models import Account  # ✅ нужен для PK-поля account_id
 from .models import (
@@ -5,12 +6,32 @@ from .models import (
     SchedulePattern, MonthSchedule, DayOverride
 )
 from identity.serializers import UserSerializer
+from common.datetime import ensure_timezone
+
+
+class AwareDateTimeField(serializers.DateTimeField):
+    default_error_messages = {
+        **serializers.DateTimeField.default_error_messages,
+        "required_timezone": "Datetime value must include timezone information (e.g. '+03:00').",
+    }
+
+    def to_internal_value(self, value):
+        dt = super().to_internal_value(value)
+        if timezone.is_naive(dt):
+            self.fail("required_timezone")
+        return timezone.localtime(dt, timezone.get_current_timezone())
+
+    def to_representation(self, value):
+        if value is None:
+            return None
+        aware_value = ensure_timezone(value, tz=timezone.get_current_timezone())
+        return super().to_representation(aware_value)
 
 
 class EventSerializer(serializers.ModelSerializer):
     # ——— Переименованные поля дат для фронта (из модели: start_datetime/end_datetime)
-    starts_at = serializers.DateTimeField(source="start_datetime", required=False)
-    ends_at = serializers.DateTimeField(source="end_datetime", allow_null=True, required=False)
+    starts_at = AwareDateTimeField(source="start_datetime", required=False)
+    ends_at = AwareDateTimeField(source="end_datetime", allow_null=True, required=False)
 
     # ——— Простой PK вместо вложенного account-объекта
     account_id = serializers.PrimaryKeyRelatedField(
@@ -84,12 +105,15 @@ class EventSerializer(serializers.ModelSerializer):
 
 
 class EventInstanceSerializer(serializers.ModelSerializer):
+    instance_datetime = AwareDateTimeField()
+
     class Meta:
         model = EventInstance
         fields = '__all__'
 
-    def validate_event(self, value):
-        """Гарантия, что выбирается только свой Event (удобно для DRF Browsable API)."""
+    # 🔹 было: validate_event → нужно validate_parent_event
+    def validate_parent_event(self, value):
+        """Гарантирует, что выбирается только свой Event (удобно для DRF Browsable API)."""
         request = self.context.get("request")
         if request is None:
             return value

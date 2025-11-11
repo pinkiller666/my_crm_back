@@ -30,6 +30,7 @@ from .weekdays import Weekday
 
 from schedule.models import PatternMode
 from .utils.schedule_helper import group_days_by_cycles
+from common.datetime import ensure_timezone
 
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,10 @@ class EventExpandedListView(generics.ListAPIView):
             m = (dt.month - 1 + months) % 12 + 1
             return dt.replace(year=y, month=m)
 
+        def _serialize_datetime(value):
+            aware_value = ensure_timezone(value, tz=tz)
+            return aware_value.isoformat()
+
         # --- границы выбранного месяца [start_dt, end_dt] (aware) ---
         start_dt = make_aware(datetime(year, month, 1, 0, 0, 0), tz)
         if month == 12:
@@ -158,7 +163,7 @@ class EventExpandedListView(generics.ListAPIView):
                                 "occurrence_id": occurrence_id,
                                 "source_event_id": event.id,
                                 "instance_id": None,
-                                "datetime": anchor,
+                                "datetime": _serialize_datetime(anchor),
                                 "event": EventSerializer(
                                     event, context={"request": request}
                                 ).data,
@@ -184,18 +189,19 @@ class EventExpandedListView(generics.ListAPIView):
                     current = series_start
                     while current <= series_end:
                         if start_dt <= current <= end_dt:
+                            current_aware = ensure_timezone(current, tz=tz)
                             instance = EventInstance.objects.filter(
                                 parent_event=event,
-                                instance_datetime=current
+                                instance_datetime=current_aware
                             ).first()
-                            unique_id = f"{event.id}_{int(current.timestamp())}"
+                            unique_id = f"{event.id}_{int(current_aware.timestamp())}"
 
                             events_data.append({
                                 "id": unique_id,
                                 "occurrence_id": unique_id,
                                 "source_event_id": event.id,
                                 "instance_id": instance.id if instance else None,
-                                "datetime": current,
+                                "datetime": current_aware.isoformat(),
                                 "event": EventSerializer(
                                     instance.parent_event if instance else event,
                                     context={"request": request}
@@ -215,13 +221,14 @@ class EventExpandedListView(generics.ListAPIView):
                 # =========================
                 if rtype == 'single' and not event.recurrence:
                     if start_dt <= event.start_datetime <= end_dt:
+                        event_start = ensure_timezone(event.start_datetime, tz=tz)
                         occurrence_id = str(event.id)
                         events_data.append({
                             "id": occurrence_id,
                             "occurrence_id": occurrence_id,
                             "source_event_id": event.id,
                             "instance_id": None,
-                            "datetime": event.start_datetime,
+                            "datetime": event_start.isoformat(),
                             "event": EventSerializer(
                                 event, context={"request": request}
                             ).data,
@@ -251,9 +258,10 @@ class EventExpandedListView(generics.ListAPIView):
                         recurrence_aware = make_aware(recurrence, tz)
 
                         unique_id = f"{event.id}_{int(recurrence_aware.timestamp())}"
+                        normalized = ensure_timezone(recurrence_aware, tz=tz)
                         instance = EventInstance.objects.filter(
                             parent_event=event,
-                            instance_datetime=recurrence_aware
+                            instance_datetime=normalized
                         ).first()
 
                         events_data.append({
@@ -261,7 +269,7 @@ class EventExpandedListView(generics.ListAPIView):
                             "occurrence_id": unique_id,
                             "source_event_id": event.id,
                             "instance_id": instance.id if instance else None,
-                            "datetime": recurrence_aware,
+                            "datetime": normalized.isoformat(),
                             "event": EventSerializer(
                                 instance.parent_event if instance else event,
                                 context={"request": request}
@@ -365,7 +373,12 @@ class DeleteEventOrOccurrenceView(APIView):
         try:
             instance_dt = datetime.fromisoformat(instance_ts)
         except ValueError:
-            return Response({"detail": "Invalid datetime format. Use ISO format."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Invalid datetime format. Use ISO format with timezone."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if timezone.is_naive(instance_dt):
+            return Response({"detail": "Datetime must include timezone information (e.g. '+03:00')."}, status=status.HTTP_400_BAD_REQUEST)
+
+        instance_dt = ensure_timezone(instance_dt, tz=timezone.get_current_timezone())
 
         event = get_object_or_404(Event, pk=event_id)
 
@@ -397,7 +410,12 @@ class UpdateOccurrenceStatusView(APIView):
         try:
             instance_dt = datetime.fromisoformat(instance_ts)
         except ValueError:
-            return Response({"detail": "Invalid datetime format."}, status=400)
+            return Response({"detail": "Invalid datetime format. Use ISO format with timezone."}, status=400)
+
+        if timezone.is_naive(instance_dt):
+            return Response({"detail": "Datetime must include timezone information (e.g. '+03:00')."}, status=400)
+
+        instance_dt = ensure_timezone(instance_dt, tz=timezone.get_current_timezone())
 
         if new_status not in CompletionStatus.values:
             return Response({"detail": "Invalid status."}, status=400)

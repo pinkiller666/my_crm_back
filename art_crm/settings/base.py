@@ -92,7 +92,10 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-    )
+    ),
+    # ⏰ формат времени
+    # None говорит DRF использовать стандартный ISO-8601 (например, 2025-11-10T12:00:00+03:00)
+    'DATETIME_FORMAT': None,
 }
 
 

@@ -12,6 +12,7 @@ from django.conf import settings
 from datetime import date
 from django.db.models import Q
 from common.choices import EventDateMode
+from common.datetime import ensure_timezone
 
 
 class CompletionStatus(models.TextChoices):
@@ -186,6 +187,9 @@ class Event(models.Model):
                     balance=0
                 )
             self.account = primary
+        current_tz = timezone.get_current_timezone()
+        self.start_datetime = ensure_timezone(self.start_datetime, tz=current_tz)
+        self.end_datetime = ensure_timezone(self.end_datetime, tz=current_tz)
         if self.date_mode == EventDateMode.NUMBER_OF_MONTH:
             if self.start_datetime:
                 self.start_datetime = self.start_datetime.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -286,6 +290,7 @@ class EventInstance(models.Model):
             self.is_completed = True
         else:
             self.is_completed = False
+        self.instance_datetime = ensure_timezone(self.instance_datetime, tz=timezone.get_current_timezone())
         super().save(*args, **kwargs)
 
     def __str__(self):
