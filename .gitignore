@@ -1,1 +1,6 @@
 *.pyc
+db.sqlite3
+schedule/__pycache__/admin.cpython-311.pyc
+schedule/__pycache__/views.cpython-311.pyc
+/devtools/management/commands/__pycache__
+*.pyc

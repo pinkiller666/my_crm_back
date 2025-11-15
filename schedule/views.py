@@ -500,6 +500,46 @@ def schedule_preview(request):
     else:
         groups = group_days_by_cycles(days, schedule.pattern)
 
+    # --- Сводка по месяцу (агрегаты для фронта) ---
+    # Часы на рабочий день: берём из pattern, иначе дефолт 8
+    hours_per_day = None
+    if schedule.pattern and hasattr(schedule.pattern, "working_day_duration"):
+        try:
+            # working_day_duration может быть Decimal/None — приводим к float/int
+            hours_per_day = float(
+                schedule.pattern.working_day_duration) if schedule.pattern.working_day_duration is not None else None
+        except (TypeError, ValueError):
+            hours_per_day = None
+
+    if hours_per_day is None:
+        hours_per_day = 8.0
+
+    # Счётчики по типам
+    type_counts = {}
+    for itm in days:
+        t = itm.get("type")
+        if not t:
+            continue
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    work_days = type_counts.get("work", 0)
+    off_days = type_counts.get("off", 0)
+    holidays = type_counts.get("holiday", 0)
+    sick_days = type_counts.get("sick", 0)
+
+    summary = {
+        "work_days": work_days,
+        "off_days": off_days,
+        "holidays": holidays,
+        "sick_days": sick_days,
+        "hours_per_day": hours_per_day,
+        "work_hours_total": int(round(work_days * hours_per_day)),
+        # при необходимости можно добавить и общее число дней:
+        "total_days": len(days),
+        # и «прочие» дни, если у вас есть другие типы:
+        "other_days": sum(c for k, c in type_counts.items() if k not in {"work", "off", "holiday", "sick"}),
+    }
+
     payload = {
         "year": year,
         "month": month,
@@ -507,6 +547,7 @@ def schedule_preview(request):
         "grouping_mode": "week" if schedule.pattern and schedule.pattern.mode == PatternMode.WEEKDAY else "type_runs",
         "groups": groups,
         "days": days,
+        "summary": summary,
     }
     return Response(payload)
 

@@ -1,19 +1,21 @@
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from random import choice, randint
-from datetime import timedelta
+from datetime import timedelta, datetime
 from calendar import monthrange
 
 from django.contrib.auth import get_user_model
 
-from identity.models import User, Manager, Artist, Commissioner, CommissionerContact, ArtistContact
+from identity.models import Manager, Artist, Commissioner, CommissionerContact, ArtistContact
 from artworks.models import Commission, PriceEntry, Artwork
 from accounting.models import Payment
-from common.choices import SocialMediaChoices
-from common.choices import currency_choices
+from common.choices import SocialMediaChoices, currency_choices, EventDateMode
 
-from schedule.models import SchedulePattern, PatternMode, MonthSchedule  # имя аппки поправь если другое
+from schedule.models import SchedulePattern, PatternMode, MonthSchedule, Event
 from decimal import Decimal
+
+import recurrence
+from recurrence import Recurrence, Rule
 
 
 class Command(BaseCommand):
@@ -131,6 +133,7 @@ class Command(BaseCommand):
                 # )
 
                 # платеж(и)
+                # расход/приход тут могут быть положительные — это именно платеж по комиссии
                 pay_amount = amount if randint(0, 1) else (amount // 2)
                 Payment.objects.create(
                     order=commission,  # ← поле называется order, не commission
@@ -142,7 +145,11 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS("Demo data created successfully."))
 
+        # базовые шаблоны расписаний
         self._ensure_schedule_patterns()
+
+        # личные события и расходы главного пользователя (nikita)
+        self._ensure_personal_events(manager_user)
 
     # ---------- helpers ----------
 
@@ -173,7 +180,10 @@ class Command(BaseCommand):
             artist=artist,
             social_media=SocialMediaChoices.BLUESKY,
             handle=f"{artist.user.username}.bsky.social",
-            defaults=dict(url=f"https://bsky.app/profile/{artist.user.username}.bsky.social", notes=""),
+            defaults=dict(
+                url=f"https://bsky.app/profile/{artist.user.username}.bsky.social",
+                notes=""
+            ),
         )
 
     def _ensure_price_list(self, artist):
@@ -214,24 +224,26 @@ class Command(BaseCommand):
             # если существовал, но структура отличается — мягко обновим
             changed = False
             if obj.mode != PatternMode.ALTERNATING:
-                obj.mode = PatternMode.ALTERNATING;
+                obj.mode = PatternMode.ALTERNATING
                 changed = True
             if obj.days_off_at_start != d_off:
-                obj.days_off_at_start = d_off;
+                obj.days_off_at_start = d_off
                 changed = True
             if (obj.pattern_after_start or []) != seq:
-                obj.pattern_after_start = seq;
+                obj.pattern_after_start = seq
                 changed = True
             if obj.weekday_map:
-                obj.weekday_map = None;
+                obj.weekday_map = None
                 changed = True
             if obj.last_day_always_working != last_work:
-                obj.last_day_always_working = last_work;
+                obj.last_day_always_working = last_work
                 changed = True
             if obj.working_day_duration != hours:
-                obj.working_day_duration = hours;
+                obj.working_day_duration = hours
                 changed = True
-            if changed: obj.full_clean(); obj.save()
+            if changed:
+                obj.full_clean()
+                obj.save()
 
             created.append((obj.name, was_created))
 
@@ -239,9 +251,11 @@ class Command(BaseCommand):
         weekday_sets = [
             # name, weekday_map
             ("Пн–Пт рабочие, Сб–Вс выходные",
-             {"mon": "work", "tue": "work", "wed": "work", "thu": "work", "fri": "work", "sat": "off", "sun": "off"}),
+             {"mon": "work", "tue": "work", "wed": "work",
+              "thu": "work", "fri": "work", "sat": "off", "sun": "off"}),
             ("Пн,Вт — работа; Ср — выходной; Чт,Пт — работа; Сб,Вс — выходные",
-             {"mon": "work", "tue": "work", "wed": "off", "thu": "work", "fri": "work", "sat": "off", "sun": "off"}),
+             {"mon": "work", "tue": "work", "wed": "off",
+              "thu": "work", "fri": "work", "sat": "off", "sun": "off"}),
         ]
 
         for name, wm in weekday_sets:
@@ -260,24 +274,26 @@ class Command(BaseCommand):
             # мягкое обновление при расхождениях
             changed = False
             if obj.mode != PatternMode.WEEKDAY:
-                obj.mode = PatternMode.WEEKDAY;
+                obj.mode = PatternMode.WEEKDAY
                 changed = True
             if obj.days_off_at_start != 0:
-                obj.days_off_at_start = 0;
+                obj.days_off_at_start = 0
                 changed = True
             if obj.pattern_after_start:
-                obj.pattern_after_start = [];
+                obj.pattern_after_start = []
                 changed = True
             if (obj.weekday_map or {}) != wm:
-                obj.weekday_map = wm;
+                obj.weekday_map = wm
                 changed = True
             if obj.last_day_always_working:
-                obj.last_day_always_working = False;
+                obj.last_day_always_working = False
                 changed = True
             if obj.working_day_duration != Decimal("4.00"):
-                obj.working_day_duration = Decimal("4.00");
+                obj.working_day_duration = Decimal("4.00")
                 changed = True
-            if changed: obj.full_clean(); obj.save()
+            if changed:
+                obj.full_clean()
+                obj.save()
 
             created.append((obj.name, was_created))
 
@@ -334,6 +350,7 @@ class Command(BaseCommand):
                     defaults={"pattern": pat_prev},
                 )
 
+            # иногда — следующий месяц
             if randint(0, 1):
                 next_year = year
                 next_month = month + 1
@@ -348,3 +365,376 @@ class Command(BaseCommand):
                     month=next_month,
                     defaults={"pattern": pat_next},
                 )
+
+    # ========== ЛИЧНЫЕ СОБЫТИЯ ДЛЯ nikita ==========
+
+    def _ensure_personal_events(self, user):
+        """
+        Создаём демо-события, которые отражают твою реальную жизнь:
+        - еженедельные тренировки и психолога;
+        - ежемесячные расходы;
+        - рандомные позитивные нефинансовые события.
+        """
+        self._create_weekly_personal_events(user)
+        self._create_monthly_personal_events(user)
+        self._create_random_positive_events(user)
+
+    def _create_weekly_personal_events(self, user):
+        """
+        Еженедельные события:
+        - 'Тренировка' (нефинансовая, по четвергам, без длительности)
+        - 'Тренировка с тренером' (расход -1500, по воскресеньям)
+        - 'Танин психолог' (расход -3500, по четвергам)
+        """
+        tz = timezone.get_current_timezone()
+        today = timezone.localdate()
+
+        def get_next_weekday(base_date, target_weekday: int):
+            """
+            target_weekday: 0=Пн .. 6=Вс
+            Возвращает ближайшую дату с нужным днём недели (сегодня или позже).
+            """
+            offset = (target_weekday - base_date.weekday()) % 7
+            return base_date + timedelta(days=offset)
+
+        # Четверг и воскресенье
+        thursday_date = get_next_weekday(today, 3)  # 3 = Thu
+        sunday_date = get_next_weekday(today, 6)  # 6 = Sun
+
+        def make_dt(date_obj, hour: int, minute: int) -> datetime:
+            naive = datetime(
+                date_obj.year,
+                date_obj.month,
+                date_obj.day,
+                hour,
+                minute,
+            )
+            return timezone.make_aware(naive, tz)
+
+        # RRULE-ы для четверга и воскресенья
+        weekly_thursday = recurrence.Recurrence(
+            rrules=[
+                recurrence.Rule(
+                    recurrence.WEEKLY,
+                    byday=[recurrence.TH],
+                )
+            ]
+        )
+        weekly_sunday = recurrence.Recurrence(
+            rrules=[
+                recurrence.Rule(
+                    recurrence.WEEKLY,
+                    byday=[recurrence.SU],
+                )
+            ]
+        )
+
+        # 1) Нефинансовая тренировка по четвергам, без длительности
+        Event.objects.update_or_create(
+            user=user,
+            name="Тренировка",
+            event_type=Event.EventType.EVENT,
+            date_mode=EventDateMode.EXACT_DATE,
+            defaults=dict(
+                description="Нефинансовая тренировка по четвергам.",
+                amount=None,
+                start_datetime=make_dt(thursday_date, 12, 0),  # время условное, главное — день
+                end_datetime=None,
+                duration_minutes=None,
+                recurrence=weekly_thursday,
+                is_active=True,
+                category=Event.CategoryChoices.SPORT,
+                type=Event.TypeChoices.ROUTINE,
+                is_recurring_monthly=False,
+                month_interval=None,
+            ),
+        )
+
+        # 2) Тренировка с тренером — по воскресеньям, расход -1500
+        Event.objects.update_or_create(
+            user=user,
+            name="Тренировка с тренером",
+            event_type=Event.EventType.EVENT,
+            date_mode=EventDateMode.EXACT_DATE,
+            defaults=dict(
+                description="Тренировка с тренером (еженедельно по воскресеньям).",
+                amount=Decimal("-1500"),
+                start_datetime=make_dt(sunday_date, 11, 0),
+                end_datetime=None,
+                duration_minutes=80,  # 11:00–12:20
+                recurrence=weekly_sunday,
+                is_active=True,
+                category=Event.CategoryChoices.SPORT,
+                type=Event.TypeChoices.IMPORTANT,
+                is_recurring_monthly=False,
+                month_interval=None,
+            ),
+        )
+
+        # 3) Танин психолог — по четвергам, расход -3500
+        Event.objects.update_or_create(
+            user=user,
+            name="Танин психолог",
+            event_type=Event.EventType.EVENT,
+            date_mode=EventDateMode.EXACT_DATE,
+            defaults=dict(
+                description="Сессия психолога для Тани (еженедельно по четвергам).",
+                amount=Decimal("-3500"),
+                start_datetime=make_dt(thursday_date, 13, 0),
+                end_datetime=None,
+                duration_minutes=60,
+                recurrence=weekly_thursday,
+                is_active=True,
+                category=Event.CategoryChoices.MEDICAL,
+                type=Event.TypeChoices.IMPORTANT,
+                is_recurring_monthly=False,
+                month_interval=None,
+            ),
+        )
+
+    def _create_monthly_personal_events(self, user):
+        """
+        Ежемесячные события через NUMBER_OF_MONTH:
+        - Оплата квартиры (-40000)
+        - Оплата коммуналки (-10000)
+        - Собачьи расходники (-6000)
+        - Быть псом (бесплатно)
+        Для трёх месяцев: прошлый, текущий, следующий.
+        """
+        today = timezone.localdate()
+        tz = timezone.get_current_timezone()
+
+        def iter_months(center_date):
+            year = center_date.year
+            month = center_date.month
+            for delta in (-1, 0, 1):
+                y = year
+                m = month + delta
+                if m < 1:
+                    m += 12
+                    y -= 1
+                elif m > 12:
+                    m -= 12
+                    y += 1
+                yield y, m
+
+        for year, month in iter_months(today):
+            naive = datetime(year, month, 1, 0, 0)
+            start_dt = timezone.make_aware(naive, tz)
+
+            # Оплата квартиры
+            Event.objects.update_or_create(
+                user=user,
+                name="Оплата квартиры",
+                date_mode=EventDateMode.NUMBER_OF_MONTH,
+                month_year=year,
+                month_number=month,
+                defaults=dict(
+                    description="Ежемесячная оплата квартиры.",
+                    amount=Decimal("-40000"),
+                    start_datetime=start_dt,
+                    end_datetime=None,
+                    duration_minutes=None,
+                    recurrence=None,
+                    is_recurring_monthly=False,
+                    month_interval=None,
+                    is_active=True,
+                    category=Event.CategoryChoices.LIFE,
+                    type=Event.TypeChoices.IMPORTANT,
+                ),
+            )
+
+            # Оплата коммуналки
+            Event.objects.update_or_create(
+                user=user,
+                name="Оплата коммуналки",
+                date_mode=EventDateMode.NUMBER_OF_MONTH,
+                month_year=year,
+                month_number=month,
+                defaults=dict(
+                    description="Ежемесячная оплата коммунальных услуг.",
+                    amount=Decimal("-10000"),
+                    start_datetime=start_dt,
+                    end_datetime=None,
+                    duration_minutes=None,
+                    recurrence=None,
+                    is_recurring_monthly=False,
+                    month_interval=None,
+                    is_active=True,
+                    category=Event.CategoryChoices.LIFE,
+                    type=Event.TypeChoices.ROUTINE,
+                ),
+            )
+
+            # Собачьи расходники
+            Event.objects.update_or_create(
+                user=user,
+                name="Собачьи расходники",
+                date_mode=EventDateMode.NUMBER_OF_MONTH,
+                month_year=year,
+                month_number=month,
+                defaults=dict(
+                    description="Корм, вкусняшки и расходники для хвостиков.",
+                    amount=Decimal("-6000"),
+                    start_datetime=start_dt,
+                    end_datetime=None,
+                    duration_minutes=None,
+                    recurrence=None,
+                    is_recurring_monthly=False,
+                    month_interval=None,
+                    is_active=True,
+                    category=Event.CategoryChoices.LIFE,
+                    type=Event.TypeChoices.ROUTINE,
+                ),
+            )
+
+            # Быть псом (бесплатно)
+            Event.objects.update_or_create(
+                user=user,
+                name="Быть псом (бесплатно)",
+                date_mode=EventDateMode.NUMBER_OF_MONTH,
+                month_year=year,
+                month_number=month,
+                defaults=dict(
+                    description="Быть псом, радоваться жизни и махать хвостом.",
+                    amount=None,
+                    start_datetime=start_dt,
+                    end_datetime=None,
+                    duration_minutes=None,
+                    recurrence=None,
+                    is_recurring_monthly=False,
+                    month_interval=None,
+                    is_active=True,
+                    category=Event.CategoryChoices.LIFE,
+                    type=Event.TypeChoices.FUN,
+                    tags=["demo", "doggo"],
+                ),
+            )
+
+    def _create_random_positive_events(self, user):
+        """
+        Рандомные позитивные нефинансовые события:
+        - Кушать пиццу
+        - Трогать траву
+        - Фантазировать о суперсилах
+        - Вычесывать хвостиков
+        - Выгуливать хвостиков
+        - Обнять себя
+        - Улыбнуться себе в зеркало
+        - Любоваться облаками
+        - Радоваться жизни
+
+        Для прошлый/текущий/следующий месяц:
+        - генерим чуть больше событий (примерно 10–14 на месяц),
+        - гарантируем минимум два кластера,
+          где в течение трёх дней подряд есть события.
+        """
+        names = [
+            "Кушать пиццу",
+            "Трогать траву",
+            "Фантазировать о суперсилах",
+            "Вычесывать хвостиков",
+            "Выгуливать хвостиков",
+            "Обнять себя",
+            "Улыбнуться себе в зеркало",
+            "Любоваться облаками",
+            "Радоваться жизни",
+        ]
+
+        today = timezone.localdate()
+        tz = timezone.get_current_timezone()
+
+        def iter_months(center_date):
+            year = center_date.year
+            month = center_date.month
+            for delta in (-1, 0, 1):
+                y = year
+                m = month + delta
+                if m < 1:
+                    m += 12
+                    y -= 1
+                elif m > 12:
+                    m -= 12
+                    y += 1
+                yield y, m
+
+        for year, month in iter_months(today):
+            days_in_month = monthrange(year, month)[1]
+
+            # --- гарантируем два кластера по 3 дня подряд ---
+            clusters = []
+            attempts = 0
+
+            while len(clusters) < 2 and attempts < 50:
+                # старт так, чтобы помещались 3 дня подряд
+                start_day = randint(1, days_in_month - 2)
+                cluster_days = {start_day, start_day + 1, start_day + 2}
+
+                # не даём кластерам полностью совпасть
+                if not any(cluster_days & existing for existing in clusters):
+                    clusters.append(cluster_days)
+
+                attempts += 1
+
+            # если что-то пошло совсем странно (теоретически не должно) — fallback
+            if not clusters:
+                clusters = [{1, 2, 3}, {5, 6, 7}]
+
+            hours_choices = [10, 12, 14, 16, 18, 20]
+
+            # События внутри кластеров
+            for cluster_days in clusters:
+                for day in sorted(cluster_days):
+                    hour = choice(hours_choices)
+                    naive = datetime(year, month, day, hour, 0)
+                    start_dt = timezone.make_aware(naive, tz)
+
+                    Event.objects.create(
+                        user=user,
+                        name=choice(names),
+                        event_type=Event.EventType.EVENT,
+                        date_mode=EventDateMode.EXACT_DATE,
+                        description="Позитивное демо-событие (кластер).",
+                        amount=None,
+                        start_datetime=start_dt,
+                        end_datetime=None,
+                        duration_minutes=None,
+                        recurrence=None,
+                        is_recurring_monthly=False,
+                        month_interval=None,
+                        is_active=True,
+                        category=Event.CategoryChoices.LIFE,
+                        type=Event.TypeChoices.FUN,
+                        tags=["demo", "positive"],
+                    )
+
+            # --- добавляем ещё немного рандомных событий вокруг ---
+            base_events = len(clusters) * 3
+            target_total = randint(10, 14)
+            extra_events = max(0, target_total - base_events)
+
+            for _ in range(extra_events):
+                day = randint(1, days_in_month)
+                hour = choice(hours_choices)
+                naive = datetime(year, month, day, hour, 0)
+                start_dt = timezone.make_aware(naive, tz)
+
+                Event.objects.create(
+                    user=user,
+                    name=choice(names),
+                    event_type=Event.EventType.EVENT,
+                    date_mode=EventDateMode.EXACT_DATE,
+                    description="Позитивное демо-событие.",
+                    amount=None,
+                    start_datetime=start_dt,
+                    end_datetime=None,
+                    duration_minutes=None,
+                    recurrence=None,
+                    is_recurring_monthly=False,
+                    month_interval=None,
+                    is_active=True,
+                    category=Event.CategoryChoices.LIFE,
+                    type=Event.TypeChoices.FUN,
+                    tags=["demo", "positive"],
+                )
+

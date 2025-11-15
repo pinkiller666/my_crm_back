@@ -1,4 +1,13 @@
-# BACK — admin.py
+from django.contrib import admin
+from django.http import JsonResponse, Http404
+from django.urls import path
+from django.utils.decorators import method_decorator
+from django.contrib.admin.views.decorators import staff_member_required
+
+from .models import Event, EventInstance, Slot
+from .forms import EventAdminForm
+from accounting.models import Account
+
 from django import forms
 from django.contrib import admin
 from django.core.exceptions import ValidationError
@@ -10,35 +19,91 @@ from .models import (
 )
 
 
-# --- Твои существующие админы оставляем как есть (я ниже трону только SchedulePattern/MonthSchedule) ---
-
-@admin.register(EventInstance)
-class EventInstanceAdmin(admin.ModelAdmin):
-    list_display = ("parent_event", "instance_datetime", "status", "modified_at")
-    list_filter = ("status",)
-    ordering = ("-modified_at",)
-
-
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
+    form = EventAdminForm
+
     list_display = ("name", "amount", "account", "start_datetime", "status", "is_active")
     search_fields = ("name", "description", "account__name")
-    list_filter = ("is_active", "status")
+    list_filter = ("is_active", "status", "date_mode", "is_recurring_monthly")
     ordering = ("-start_datetime",)
     filter_horizontal = ()
+
     fieldsets = (
         ("General", {
-            "fields": ("name", "description", "amount", "account", "tags", "is_balance_correction", "user",)
+            "fields": (
+                "name", "description", "amount",
+                # ⬇️ сначала user, потом account
+                "user", "account",
+                "tags", "is_balance_correction",
+            ),
         }),
         ("Time & Recurrence", {
-            "fields": ("start_datetime", "end_datetime", "duration_minutes", "recurrence")
+            "fields": (
+                "start_datetime", "end_datetime",
+                "duration_minutes", "recurrence",
+            ),
+        }),
+        ("Monthly mode", {
+            "fields": (
+                "date_mode", "month_year", "month_number",
+                "is_recurring_monthly", "month_interval",
+                "months_span"
+            ),
+            "description": (
+                "Для событий, привязанных к месяцу. "
+                "При режиме 'number_of_month' для повторяемых событий "
+                "старт/финиш вычисляются автоматически."
+            ),
         }),
         ("Status & Metadata", {
             "fields": ("is_active", "status", "created_at", "updated_at"),
             "classes": ("collapse",),
         }),
     )
+
     readonly_fields = ("created_at", "updated_at")
+
+    # Подключаем наш JS и CSS к форме админки
+    class Media:
+        js = ("schedule_admin/event_admin.js",)
+        css = {"all": ("schedule_admin/event_admin.css",)}
+
+    # Мини-роут для получения дефолтного счёта пользователя
+    def get_urls(self):
+        urls = super().get_urls()
+
+        @method_decorator(staff_member_required)
+        def default_account_view(request):
+            user_id = request.GET.get("user_id")
+            if not user_id:
+                raise Http404("user_id is required")
+
+            # Предполагаем, что в Account есть флаг is_default или аналог.
+            # Если у тебя по-другому — поправь отбор ниже.
+            account = Account.objects.filter(user_id=user_id, is_default=True).first()
+            if not account:
+                # fallback: первый аккаунт пользователя
+                account = Account.objects.filter(user_id=user_id).order_by("id").first()
+
+            payload = {"account_id": account.id if account else None}
+            return JsonResponse(payload)
+
+        custom = [
+            path(
+                "event/default-account/",
+                self.admin_site.admin_view(default_account_view),
+                name="event_default_account",
+            ),
+        ]
+        return custom + urls
+
+
+@admin.register(EventInstance)
+class EventInstanceAdmin(admin.ModelAdmin):
+    list_display = ("parent_event", "instance_datetime", "status", "modified_at")
+    list_filter = ("status",)
+    ordering = ("-modified_at",)
 
 
 @admin.register(Slot)
@@ -63,6 +128,7 @@ WEEK_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
 class SchedulePatternForm(forms.ModelForm):
     class Media:
         js = ('admin/js/schedulepattern_toggle.js',)
+
     """
     Удобная форма:
     - В режиме ALTERNATING редактируем pattern_text (строка "2,2,2,1")

@@ -1,0 +1,27 @@
+.event-hidden { display: none; }
+
+.event-toggles {
+  padding: 12px 14px;
+  margin: 8px 0 12px 0;
+  background: var(--body-bg, #f8f8f8);
+  border: 1px solid #e5e5e5;
+  border-radius: 6px;
+}
+
+.event-toggle-label {
+  margin: 6px 0 4px 0;
+  font-weight: 600;
+}
+
+.event-toggle-group label {
+  margin-right: 16px;
+}
+
+/* Однострочный вид для Tags */
+.field-tags input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
