@@ -21,6 +21,8 @@ class Account(models.Model):
     is_archived = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    currency = models.CharField(max_length=3, choices=currency_choices)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
 
     user = models.ForeignKey(
         User,
@@ -59,7 +61,6 @@ class Account(models.Model):
         - Для существующего: сразу выполняем CASE-апдейт.
         - Если это первый счёт пользователя — автоматически делаем его primary.
         """
-        print('ПЕНИС')
         want_primary = bool(self.is_primary)
         is_new = self.pk is None
         print(want_primary, is_new)

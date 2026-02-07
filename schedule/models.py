@@ -68,7 +68,8 @@ class Event(models.Model):
     date_mode = models.CharField(
         max_length=20,
         choices=EventDateMode.choices,
-        default=EventDateMode.EXACT_DATE
+        default=EventDateMode.EXACT_DATE,
+        blank=True,
     )
     recurrence = RecurrenceField(blank=True, null=True, include_dtstart=False)
     start_datetime = models.DateTimeField(default=timezone.now)

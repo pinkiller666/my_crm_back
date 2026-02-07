@@ -5,6 +5,8 @@ from schedule.models import Slot
 from identity.models import Artist, Commissioner
 from django.contrib.auth import get_user_model
 from common.choices import currency_choices
+from django.conf import settings
+
 
 User = get_user_model()
 
@@ -74,6 +76,11 @@ class Artwork(models.Model):
         validators=[FileExtensionValidator(allowed_extensions=['jpg', 'jpeg', 'png', 'webp'])],
     )
 
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='artworks'
+    )
     description = models.TextField()
     type = models.CharField(max_length=50, choices=TYPE_CHOICES)
     purpose = models.CharField(max_length=50, choices=PURPOSE_CHOICES, default='commission')

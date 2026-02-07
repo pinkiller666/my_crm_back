@@ -4,7 +4,7 @@ from django.urls import path, include
 
 
 router = DefaultRouter()
-router.register(r'accounts', AccountViewSet)
+router.register(r'accounts', AccountViewSet)   # queryset is defined → basename auto
 router.register(r'payments', PaymentViewSet)
 router.register(r'payouts', PayoutViewSet)
 
